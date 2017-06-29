@@ -13,51 +13,75 @@
 
 // stack handles
 typedef enum {
-	TREND_STATE_UNDEFINED,
-	TREND_STATE_STAGNANT,
-	TREND_STATE_INCREASING,
-	TREND_STATE_DECREASING,
-	TREND_STATE_OSCILLATORY
-} trendState;
+	RIBBON_STATE_MOON,
+	RIBBON_STATE_CRASH,
+	RIBBON_STATE_KNOT,
+	RIBBON_STATE_COIL,
+	RIBBON_STATE_TWIST,
+	RIBBON_STATE_TWIRL,
+	RIBBON_STATE_BUNDLE,
+	RIBBON_STATE_FLAT
+} ribbonState;
 
 typedef enum {
-	ORDER_STATE_ACTIVE,
-	ORDER_STATE_EMPTY,
+	LACE_STATE_TIGHT,
+	LACE_STATE_LOOSE,
+	LACE_STATE_DIVERGENCE,
+	LACE_STATE_UNTIED
+} laceState;
+
+typedef enum {
+	ORDER_STATE_BUY,
+	ORDER_STATE_SELL,
+	ORDER_STATE_EMPTY
 } orderState;
 
 typedef struct {
-	trendState trend;
+	ribbonState ribbon;
+	laceState lace;
 	orderState order;
 	time_t orderTimer;
 	time_t probeTimer;
-	time_t trendTimer;
-	time_t anchorTimer;
+	float data[360];
+	unsigned int minuteAverage;
+	unsigned int tenMinuteAverage;
+	unsigned int hrMovingAverage;
+	unsigned int minuteHigh;
+	unsigned int tenMinuteHigh;
+	unsigned int hrHigh;
+	unsigned int minuteLow;
+	unsigned int tenMinuteLow;
+	unsigned int hrLow;
+	int lace1;
+	int lace2;
+	int lace3;
+	int lace1High;
+	int lace2High;
+	int lace3High;
+	int lace1Low;
+	int lace2Low;
+	int lace3Low;
+	int sellSignals;
+	int buySignals;
+	float beta0;
+	float beta1;
 	char name[5];
 	float num;
 	float askSat;
 	float bidSat;
+	float lastSat;
 	float spread;
 	char btcValue[11];
 	float btcNet;
-	float anchor[2];
 	int deviation;
 	char sellUUID[37];
 	char buyUUID[37];
-	float dMin;
-	float dHr;
-	float dTwelveHr;
-	float dDay;
-	float dThreeDay;
-	float dWeek;
-	float dMonth;
-	float dThreeMonth;
 } coin;
 
 typedef struct {
 	int transactions;
 	int mistakes;
 	float tPerHour;
-	float margin;
 	time_t timer;
 } botData;
 
@@ -74,6 +98,9 @@ unsigned char key[] = { 0x39, 0x34, 0x39, 0x39, 0x63, 0x65, 0x36, 0x37, 0x66, 0x
 char* secret = "9499ce67f41f44dbbd061e16871c7d7d";
 float btcAsset;
 int btcAssetSat;
+int poolSize = 360; // must be even
+float filter = .001; // fluctuation filter
+int period = 10000; // 10 second period
 
 // prototypes
 int connectBittrex();
@@ -86,6 +113,12 @@ int getCoinBalance(coin* coin);
 int getCoinPrice(coin* coin);
 int getOrder(char* uuid);
 int cancelOrder(char* uuid);
+float leastSquares(float* coinData);
+void movingAverage(float* data, int points, int* movingAverage);
+void fillData(coin* coins, int points, int numCoins);
+void updateData(coin* coin);
+void tieRibbon(coin* coin);
+void checkLaces(coin* coin);
 
 int connectBittrex()
 {
@@ -144,7 +177,7 @@ void disconnectBittrex()
 
 void genSignature(char* message, char* hash)
 {
-	// HERE BE MADNESS
+	// HERE BE MACDNESS
 
 	int len;
 	char buffer[8];
@@ -178,15 +211,24 @@ void initCoins(coin* coins, int numCoins)
 		// get account balance
 		getCoinBalance(&coins[i]);
 
-		// initialize anchors
-		coins[i].anchor[0] = 0;
-		coins[i].anchor[1] = 0;
+		coins[i].lace1 = 0;
+		coins[i].lace2 = 0;
+		coins[i].lace3 = 0;
+		coins[i].sellSignals = 0;
+		coins[i].buySignals = 0;
+		coins[i].lace3High = 0;
+		coins[i].lace3Low = 0;
 
-		coins[i].trend = TREND_STATE_UNDEFINED;
-		coins[i].order = ORDER_STATE_EMPTY;
+		// initialize buffers
+		for (int j = 0; j < poolSize; j++)
+		{
+			coins[i].data[j] = 0;
+		}
 
-		time(&coins[i].trendTimer);
-		time(&coins[i].anchorTimer);
+		coins[i].order = ORDER_STATE_SELL;
+		coins[i].ribbon = RIBBON_STATE_FLAT;
+		coins[i].lace = LACE_STATE_UNTIED;
+
 	}
 }
 
@@ -359,6 +401,7 @@ int buyCoins(coin* coin, int rate)
 	
 	// acquire uuid
 	memcpy(&coin->buyUUID[0], strstr(&reply[0], "uuid") + 7, 36);
+	coin->buyUUID[36] = '\0';
 
 	printf("Buying %f %s at %i sat/ea.\n", coin->num * 1.0050, coin->name, rate);
 
@@ -380,7 +423,7 @@ int sellCoins(coin* coin, int rate)
 	char success[512];
 	char hash[512];
 	char nonce[50];
-	int received, j;
+	int received;
 
 	// sat to btc converstion
 	sprintf(buffer3, "%i", rate);
@@ -436,6 +479,7 @@ int sellCoins(coin* coin, int rate)
 
 	// acquire uuid
 	memcpy(&coin->sellUUID[0], strstr(reply, "uuid") + 7, 36);
+	coin->sellUUID[36] = '\0';
 
 	printf("Selling %f %s at %i sat/ea.\n", coin->num, coin->name, rate);
 
@@ -452,6 +496,7 @@ int getCoinPrice(coin* coin)
 	char reply[5000];
 	char askBuff[32];
 	char bidBuff[32];
+	char lastBuff[32];
 	int received;
 
 	strcpy(message, "GET https://bittrex.com/api/v1.1/public/getmarketsummary?market=btc-");
@@ -481,13 +526,16 @@ int getCoinPrice(coin* coin)
 	{
 		strncpy(askBuff, strstr(&reply[0], "Ask") + 8, 7);
 		strncpy(bidBuff, strstr(&reply[0], "Bid") + 8, 7);
+		strncpy(lastBuff, strstr(&reply[0], "Last\"") + 9, 7);
 	}
 	askBuff[10] = '\0';
 	bidBuff[10] = '\0';
+	lastBuff[10] = '\0';
 
 	// assign new market values
 	coin->askSat = atoi(askBuff);
 	coin->bidSat = atoi(bidBuff);
+	coin->lastSat = atoi(lastBuff);
 	coin->spread = coin->askSat - coin->bidSat;
 
 	return 1;
@@ -537,7 +585,6 @@ int getOrder(char* uuid)
 		return -1;
 	}
 	reply[received] = '\0';
-	printf("%s\n", reply);
 	// get state
 	memcpy(order, strstr(reply, "IsOpen"), 80);
 	// clear socket buffer
@@ -618,6 +665,279 @@ int cancelOrder(char* uuid)
 	return 1;
 }
 
+float leastSquares(float* coinData)
+{
+	int i = 0;
+	int points = sizeof(coinData) / sizeof(float);
+	float s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+
+	for (i = 0; i < points; i++)
+	{
+		s4 += coinData[i];
+		s3 += 10 * i;
+		s2 += (10 * i) * (10 * i);
+		s1 += coinData[i] * (10 * i);
+	}
+
+	return (points * s1 - s3 * s4) / (points * s2 - s3 * s3);
+}
+
+void movingAverage(float* data, int points, int* movingAverage)
+{
+	unsigned int s = 0;
+
+	for (int i = 0; i < points; i++)
+	{
+		s += data[i];
+	}
+
+	*movingAverage = (int)((float)s / points);
+}
+
+void fillData(coin* coins, int points, int numCoins)
+{
+	int dataCounter = poolSize - 1;
+	int i = 0;
+
+	// fill pools
+	while (dataCounter >= 0)
+	{
+		for (i = 0; i < numCoins; i++)
+		{
+			// acquire new market value
+			if (!getCoinPrice(&coins[i]))
+			{
+				if (!getCoinPrice(&coins[i]))
+				{
+					printf("Fatal network error.\n");
+					continue;
+				}
+			}
+
+			// dump in pool
+			coins[i].data[dataCounter] = coins[i].lastSat;
+			printf("%s data point %i is %i.\n", coins[i].name, dataCounter + 1, (int)coins[i].lastSat);
+		}
+		dataCounter--;
+		Sleep(period);
+	}
+
+	for (i = 0; i < numCoins; i++)
+	{
+		// 1 minute average
+		movingAverage(coins[i].data, 6, &coins[i].minuteAverage);
+		// 10 minute average
+		movingAverage(coins[i].data, 60, &coins[i].tenMinuteAverage);
+		// 1 hour average
+		movingAverage(coins[i].data, poolSize, &coins[i].hrMovingAverage);
+	}
+}
+
+void updateData(coin* coin)
+{
+	if (!getCoinPrice(coin))
+	{
+		if (!getCoinPrice(coin))
+		{
+			printf("Fatal network error.\n");
+		}
+	}
+
+	// new_average = old_average - (point_oldest / n) + (point_newest / n)
+	// shift old data pool, insert new value
+	coin->minuteAverage = coin->minuteAverage - (coin->data[5] / 6);
+	coin->tenMinuteAverage = coin->tenMinuteAverage - (coin->data[59] / 60);
+	coin->hrMovingAverage = coin->hrMovingAverage - (coin->data[poolSize - 1] / poolSize);
+
+	memmove(&coin->data[1], &coin->data[0], sizeof(float) * (poolSize - 1));
+	coin->data[0] = coin->lastSat;
+
+	coin->minuteAverage = coin->minuteAverage + (coin->data[0] / 6);
+	coin->tenMinuteAverage = coin->tenMinuteAverage + (coin->data[0] / 60);
+	coin->hrMovingAverage = coin->hrMovingAverage + (coin->data[0] / poolSize);
+
+	coin->lace1 = coin->minuteAverage - coin->tenMinuteAverage;
+	coin->lace2 = coin->minuteAverage - coin->hrMovingAverage;
+	coin->lace3 = coin->tenMinuteAverage - coin->hrMovingAverage;
+	printf("%s Laces: %i, %i, %i.\n", coin->name, coin->lace1, coin->lace2, coin->lace3);
+	printf("%s has a 1 minute MA of %i sat.\n", coin->name, (int)coin->minuteAverage);
+	printf("%s has a 10 minute MA of %i sat.\n", coin->name, (int)coin->tenMinuteAverage);
+	printf("%s has a 1 hour MA of %i sat.\n", coin->name, (int)coin->hrMovingAverage);
+}
+
+void tieRibbon(coin* coin)
+{
+	// apply fluctuation filter
+	if (abs(coin->lace1) < coin->lastSat * filter)
+	{
+		printf("%s Lace 1 overlap detected. This could imply multiple things.\n", coin->name);
+		if (abs(coin->lace3) < coin->lastSat * filter)
+		{
+			printf("%s is bundling...\n");
+			coin->ribbon = RIBBON_STATE_BUNDLE;
+		}
+	}
+	else if (coin->lace1 > 0)
+	{
+		if (coin->lace3 > 0)
+		{
+			if ((coin->ribbon == RIBBON_STATE_KNOT || coin->ribbon == RIBBON_STATE_COIL) && coin->sellSignals > 0)
+			{
+				printf("%s was disentangled. Removing sell signal...\n", coin->name);
+				coin->sellSignals--;
+			}
+			coin->ribbon = RIBBON_STATE_MOON;
+			printf("%s is mooning...\n", coin->name);
+		}
+		else if (coin->lace2 > 0)
+		{
+			if (coin->ribbon == RIBBON_STATE_CRASH)
+			{
+				printf("%s is becoming entangled. This is a buy signal.\n", coin->name);
+				coin->buySignals++;
+			}
+			coin->ribbon = RIBBON_STATE_TWIST;
+			printf("%s is twisting...\n", coin->name);
+		}
+		else
+		{
+			if (coin->ribbon == RIBBON_STATE_CRASH)
+			{
+				printf("%s is becoming entangled. This is a buy signal.\n", coin->name);
+				coin->buySignals++;
+			}
+			coin->ribbon = RIBBON_STATE_TWIRL;
+			printf("%s is twirling...\n", coin->name);
+		}
+	}
+	else if (coin->lace3 > 0)
+	{
+		if (coin->lace2 > 0)
+		{
+			if (coin->ribbon == RIBBON_STATE_MOON)
+			{
+				printf("%s is becoming entangled. This is a sell signal.\n", coin->name);
+				coin->sellSignals++;
+			}
+			coin->ribbon = RIBBON_STATE_KNOT;
+			printf("%s is knotting...\n", coin->name);
+		}
+		else
+		{
+			if (coin->ribbon == RIBBON_STATE_MOON)
+			{
+				printf("%s is becoming entangled. This is a sell signal.\n", coin->name);
+				coin->sellSignals++;
+			}
+			coin->ribbon = RIBBON_STATE_COIL;
+			printf("%s is coiling...\n", coin->name);
+		}
+	}
+	else
+	{
+		if ((coin->ribbon == RIBBON_STATE_TWIST || coin->ribbon == RIBBON_STATE_TWIRL) && coin->buySignals > 0)
+		{
+			printf("%s was disentangled. Removing buy signal...\n", coin->name);
+			coin->buySignals--;
+		}
+		coin->ribbon = RIBBON_STATE_CRASH;
+		printf("%s is crashing...\n", coin->name);
+	}
+}
+
+void checkLaces(coin* coin)
+{
+	switch (coin->order)
+	{
+	case ORDER_STATE_SELL:
+	{
+		if (coin->lace3 > coin->lace3High)
+		{
+			if (coin->lace == LACE_STATE_DIVERGENCE)
+			{
+				printf("%s has reformed from the divergence. Removing sell signal...\n", coin->name);
+				coin->sellSignals--;
+			}
+			else if (coin->lace == LACE_STATE_TIGHT)
+			{
+				printf("%s loosened up. Removing sell signal...\n", coin->name);
+				coin->sellSignals--;
+			}
+			coin->lace3High = coin->lace3;
+			coin->tenMinuteHigh = coin->tenMinuteAverage;
+			coin->lace = LACE_STATE_LOOSE;
+		}
+		else if (coin->tenMinuteAverage > coin->tenMinuteHigh)
+		{
+			if (coin->lace != LACE_STATE_DIVERGENCE)
+			{
+				printf("%s bearish divergence detected. Possible impending recoil...\n", coin->name);
+				coin->sellSignals++;
+				coin->lace = LACE_STATE_DIVERGENCE;
+			}
+			coin->tenMinuteHigh = coin->tenMinuteAverage;
+		}
+		else
+		{
+			printf("%s tightening up...\n", coin->name);
+			if (coin->lace == LACE_STATE_DIVERGENCE)
+			{
+				printf("This has followed a divergence. This is a strong sell signal.\n");
+			}
+			else if (coin->lace == LACE_STATE_LOOSE)
+			{
+				printf("No divergence detected. This is a weak sell signal.\n");
+			}
+			coin->lace = LACE_STATE_TIGHT;
+		}
+		break;
+	}
+	case ORDER_STATE_BUY:
+	{
+		if (coin->lace3 < coin->lace3Low)
+		{
+			if (coin->lace == LACE_STATE_DIVERGENCE)
+			{
+				printf("%s has reformed from the divergence. Removing buy signal...\n", coin->name);
+				coin->buySignals--;
+			}
+			else if (coin->lace == LACE_STATE_TIGHT)
+			{
+				printf("%s loosened up. Removing buy signal...\n", coin->name);
+				coin->buySignals--;
+			}
+			coin->lace3Low = coin->lace3;
+			coin->tenMinuteLow = coin->tenMinuteAverage;
+			coin->lace = LACE_STATE_LOOSE;
+		}
+		else if (coin->tenMinuteAverage < coin->tenMinuteLow)
+		{
+			if (coin->lace != LACE_STATE_DIVERGENCE)
+			{
+				printf("%s bullish divergence detected. Possible impending recoil...\n", coin->name);
+				coin->buySignals++;
+				coin->lace = LACE_STATE_DIVERGENCE;
+			}
+			coin->tenMinuteLow = coin->tenMinuteAverage;
+		}
+		else
+		{
+			printf("%s tightening up...\n", coin->name);
+			if (coin->lace == LACE_STATE_DIVERGENCE)
+			{
+				printf("This has followed a divergence. This is a strong buy signal.\n");
+			}
+			else if (coin->lace == LACE_STATE_LOOSE)
+			{
+				printf("No divergence detected. This is a weak buy signal.\n");
+			}
+			coin->lace = LACE_STATE_TIGHT;
+		}
+		break;
+	}
+	}
+}
+
 int main(void)
 {
 	if (!connectBittrex())
@@ -626,9 +946,11 @@ int main(void)
 		return 0;
 	}
 
+	// update whenever coins are added or removed
+	unsigned int numCoins = 1;
+
 	printf("Giving life to bot...\n");
 	botData bot;
-	bot.margin = (float).0075;
 	bot.transactions = 0;
 	bot.mistakes = 0;
 	Sleep(2000);
@@ -640,8 +962,8 @@ int main(void)
 	printf("Gathering your coin data...\n");
 	Sleep(2000);
 	coin btc;
-	coin* coins = (coin*)malloc(sizeof(coin) * 2);
-	initCoins(coins, 2);
+	coin* coins = (coin*)malloc(sizeof(coin) * numCoins);
+	initCoins(coins, numCoins);
 	strcpy(btc.name, "BTC");
 	getCoinBalance(&btc);
 
@@ -656,80 +978,22 @@ int main(void)
 		printf("You appear to be quite fucking poor. Allow me to remedy this situation...\n");
 	}
 	Sleep(2000);
-	printf("Observing market trends...\n");
+	printf("Waiting 1 hour to fill data pool...\n");
+	fillData(coins, poolSize, numCoins);
+	Sleep(2000);
+	printf("Observing...\n");
 	while (i)
 	{
-		for (i = 0; i < 1; i++)
+		for (i = 0; i < numCoins; i++)
 		{
-			// acquire new market value
-			if (!getCoinPrice(&coins[i]))
-			{
-				if (!getCoinPrice(&coins[i]))
-				{
-					printf("Fatal network error.\n");
-					continue;
-				}
-			}
-
-			// generate anchors
-			if (coins[i].anchor[0] == 0)
-			{
-				coins[i].anchor[0] = coins[i].askSat;
-				coins[i].anchor[1] = coins[i].anchor[0];
-				// calculate deviation
-				coins[i].deviation = (int)ceil((.00375 * coins[i].askSat)); // ignore fluctuations < .25%
-			}
-
-			// check for new anchor every 10 seconds
-			if (difftime(time(NULL), coins[i].anchorTimer) > 10)
-			{
-				time(&coins[i].anchorTimer);
-
-				if (abs(coins[i].askSat - coins[i].anchor[0]) > coins[i].deviation)
-				{
-					// new deviation
-					coins[i].deviation = (int)ceil((.00375 * coins[i].askSat));
-
-					if (coins[i].askSat > coins[i].anchor[0] && coins[i].anchor[0] > coins[i].anchor[1])
-					{
-						printf("%s is increasing...\n", coins[i].name);
-						coins[i].trend = TREND_STATE_INCREASING;
-					}
-					else if (coins[i].askSat < coins[i].anchor[0] && coins[i].anchor[0] < coins[i].anchor[1])
-					{
-						printf("%s is decreasing...\n", coins[i].name);
-						coins[i].trend = TREND_STATE_DECREASING;
-					}
-					else if (coins[i].askSat > coins[i].anchor[0] && coins[i].anchor[0] < coins[i].anchor[1])
-					{
-						printf("%s is oscillating...\n", coins[i].name);
-						coins[i].trend = TREND_STATE_OSCILLATORY;
-					}
-					else if (coins[i].askSat < coins[i].anchor[0] && coins[i].anchor[0] > coins[i].anchor[1])
-					{
-						printf("%s is oscillating...\n", coins[i].name);
-						coins[i].trend = TREND_STATE_OSCILLATORY;
-					}
-
-					// start trend timer
-					time(&coins[i].trendTimer);
-
-					// assign new anchors
-					coins[i].anchor[1] = coins[i].anchor[0];
-					coins[i].anchor[0] = coins[i].askSat;
-				}
-				// check trend time
-				if (difftime(time(NULL), coins[i].trendTimer) > 120)
-				{
-					printf("%s is stagnant.\n", coins[i].name);
-					coins[i].trend = TREND_STATE_STAGNANT;
-					time(&coins[i].trendTimer);
-				}
-				// post new values
-				printf("Current %s value: %i Ask, %i Bid, Spread: %i\n", coins[i].name, (int)coins[i].askSat, (int)coins[i].bidSat, (int)coins[i].spread);
-			}
-
-			// market algorithms
+			updateData(&coins[i]);
+			tieRibbon(&coins[i]);
+			checkLaces(&coins[i]);
+			
+			printf("%s has %i buy and %i sell signals.\n", coins[i].name, coins[i].buySignals, coins[i].sellSignals);
+			
+			// old shit
+			/*
 			switch (coins[i].order)
 			{
 			case ORDER_STATE_EMPTY:
@@ -740,37 +1004,11 @@ int main(void)
 				{
 					break;
 				}
-				/*
 				case TREND_STATE_STAGNANT:
-
-				{
-					// wait for big spread, clamp
-					
-					
-					if (coins[i].spread > floor(coins[i].askSat * .01))
-					{
-						// since fluctuations are measured from the ask value, an undetected increase in spread will always be a reduction of the bid
-						if (!buyCoins(&coins[i], (int)floor(coins[i].bidSat * 1.001)))
-						{
-							break;
-						}
-						if (!sellCoins(&coins[i], (int)ceil(coins[i].askSat * .999)))
-						{
-							break;
-						}
-						coins[i].order = ORDER_STATE_ACTIVE;
-						time(&coins[i].orderTimer);
-						break;
-					}
-					
-					break;
-				}
-				*/
-				/*
 				case TREND_STATE_OSCILLATORY:
 				{
 					
-					if (coins[i].spread > ceil(coins[i].askSat * .0025) && coins[i].spread < ceil(coins[i].askSat * bot.margin))
+					if (coins[i].spread > ceil(coins[i].askSat * .0025))
 					{
 						// no way to predict where the trend will go except for looking at the order book and size of impacting orders
 						// for now, clamp it equally and hope
@@ -782,12 +1020,13 @@ int main(void)
 						{
 							break;
 						}
+						printf("Probing %s's order status...\n", coins[i].name);
 						coins[i].order = ORDER_STATE_ACTIVE;
 						time(&coins[i].orderTimer);
+						time(&coins[i].probeTimer);
 						break;
 					}
 				}
-				*/
 				case TREND_STATE_INCREASING:
 				{
 					// must prepare for possibility of client side transaction failure on only 1, in which case, the other must be immediately canceled
@@ -803,6 +1042,7 @@ int main(void)
 						{
 							break;
 						}
+						printf("Probing %s's order status...\n", coins[i].name);
 						coins[i].order = ORDER_STATE_ACTIVE;
 						time(&coins[i].orderTimer);
 						time(&coins[i].probeTimer);
@@ -824,6 +1064,7 @@ int main(void)
 						{
 							break;
 						}
+						printf("Probing %s's order status...\n", coins[i].name);
 						coins[i].order = ORDER_STATE_ACTIVE;
 						time(&coins[i].orderTimer);
 						time(&coins[i].probeTimer);
@@ -838,7 +1079,6 @@ int main(void)
 				// probe order status every 10 seconds
 				if (difftime(time(NULL), coins[i].probeTimer) > 10)
 				{
-					printf("Probing %s's order status...\n", coins[i].name);
 					time(&coins[i].probeTimer);
 
 					// order assessment
@@ -848,98 +1088,18 @@ int main(void)
 						{
 							coins[i].order = ORDER_STATE_EMPTY;
 							bot.transactions++;
-							bot.tPerHour = (bot.transactions * 360) / difftime(time(NULL), bot.timer);
-							printf("A transaction for %s has completed.\nI have made %i transactions at a rate of %f per hour.\nSince coming online, I have multiplied your current assets by %f.\n", coins[i].name, bot.transactions, bot.tPerHour, pow(1.0025, (double)bot.transactions));
-							/*
-							if (bot.tPerMin < 1)
-							{
-								printf("My optimal rate is at least 1 transaction per minute. Consider adding more coins and replacing the stagnant...\n");
-							}
-
-							if (bot.tPerMin > 2)
-							{
-								printf("The %s market exhibits great volatility. I have increased it's trade margin to 1%...\n");
-								bot.margin = .01;
-							}
-							*/
+							bot.tPerHour = (bot.transactions * 3600) / difftime(time(NULL), bot.timer);
+							printf("A transaction for %s has completed.\nI have MACDe %i transactions at a rate of %f per hour.\nSince coming online, I have multiplied your current assets by %f.\n", coins[i].name, bot.transactions, bot.tPerHour, pow(1.0025, (double)bot.transactions));
 							getCoinBalance(&coins[i]);
 							break;
 						}
 					}
-					// if order exceeds 30 minutes, cancel and consider it a failure
-					if (difftime(time(NULL), coins[i].orderTimer) > 3600)
-					{
-						if (getOrder(&coins[i].buyUUID[0]) == 0)
-						{
-							if (getOrder(&coins[i].sellUUID[0]) == 0)
-							{
-								if (!cancelOrder(&coins[i].sellUUID[0]))
-									break;
-								if (!cancelOrder(&coins[i].buyUUID[0]))
-									break;
-							}
-							if (!cancelOrder(&coins[i].buyUUID[0]))
-								break;
-						}
-						if (getOrder(&coins[i].sellUUID[0]) == 0)
-						{
-							if(!cancelOrder(&coins[i].sellUUID[0]))
-								break;
-						}
-					}
-
-						/*
-						// cancel sell after 10 minutes
-						if (difftime(time(NULL), coins[i].orderTimer) > 600)
-						{
-							if (!cancelOrder(&coins[i].sellUUID[0]))
-								break;
-							bot.mistakes++;
-							printf("I have made a faulty transaction. Total: %i\n", bot.mistakes);
-							coins[i].order = ORDER_STATE_EMPTY;
-							coins[i].trend = TREND_STATE_UNDEFINED;
-							getCoinBalance(&coins[i]);
-							break;
-						}
-						*/
-					
-					/*
-					if (getOrder(&coins[i].sellUUID[0]) == 1)
-					{
-						// cancel buy after 10 minutes
-						if (difftime(time(NULL), coins[i].orderTimer) > 600)
-						{
-							if (!cancelOrder(&coins[i].buyUUID[0]))
-								break;
-							bot.mistakes++;
-							printf("I have made a faulty transaction. Total: %i\n", bot.mistakes);
-							coins[i].order = ORDER_STATE_EMPTY;
-							coins[i].trend = TREND_STATE_UNDEFINED;
-							getCoinBalance(&coins[i]);
-							break;
-						}
-					}
-					// cancel both after 10 minutes
-					if (difftime(time(NULL), coins[i].orderTimer) > 600)
-					{
-						if (!cancelOrder(&coins[i].sellUUID[0]))
-							break;
-						if (!cancelOrder(&coins[i].buyUUID[0]))
-							break;
-						bot.mistakes++;
-						printf("I have made a faulty transaction. Total: %i\n", bot.mistakes);
-						coins[i].order = ORDER_STATE_EMPTY;
-						coins[i].trend = TREND_STATE_UNDEFINED;
-						getCoinBalance(&coins[i]);
-						break;
-					}
-					*/
 				}
 			}
 			}
-
+			*/
 		}
-		Sleep(500); // .5 second queries
+		Sleep(period);
 	}
 	
 	disconnectBittrex();
